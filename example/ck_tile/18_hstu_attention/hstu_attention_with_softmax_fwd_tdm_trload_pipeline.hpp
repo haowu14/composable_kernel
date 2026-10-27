@@ -69,6 +69,25 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTdmTrLoad
     static_assert(kN0 == kN0Sub && kN0 == kK1,
                   "the Tdm pipeline needs kN0 == kN0Sub == kK1, i.e. a single n0/k1 sub-loop");
 
+    // Ported from the gfx950 DirectLds pipeline (d44a4b49 + trunk):
+    // gemm_0 and gemm_1 each run as one LDS-read stream with kGemm{0,1}Prefetch B warp tiles in
+    // flight (BlockGemm::run_ahead). Only with 16x16x32 warp gemms on the hdim-128 mtile-128 tile.
+    static constexpr bool kGemmRunAhead =
+        kQKHeaddim == 128 && kM0 == 128 &&
+        std::is_same_v<typename HstuAttentionTileSetting::Gemm0WarpTile, sequence<16, 16, 32>>;
+    static constexpr index_t kGemm0Prefetch = 4;
+    static constexpr index_t kGemm1Prefetch = 4;
+
+    // Online softmax gated by a wave vote: l is kept as per-lane partial sums and reduced once
+    // after the loop; the exact cross-lane row max and the o_acc/l rescale only run on KV tiles
+    // where some lane's local max defeats the "keep the previous maximum" heuristic. The test is
+    // monotone in the row max and a row never spans waves, so the result matches the heuristic.
+    static constexpr bool kVoteGatedSoftmax =
+        kGemmRunAhead && !kHasBias && !kHasDropout && std::is_same_v<CompDataType, float>;
+    // With kVoteGatedSoftmax and fp16 P, l is accumulated in fp32 on the matrix pipe from the fp16
+    // P that feeds gemm_1 (gfx950 rowsum_mfma; here P @ ones with gemm_1's WMMA).
+    static constexpr bool kSoftmaxWmmaRowsum = kVoteGatedSoftmax && std::is_same_v<PDataType, half_t>;
+
     static constexpr bool kPadSeqLenQ   = Traits::kPadSeqLenQ;
     static constexpr bool kPadSeqLenK   = Traits::kPadSeqLenK;
     static constexpr bool kPadHeadDimQK = Traits::kPadHeadDimQK;
@@ -111,8 +130,10 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTdmTrLoad
             }
             else if constexpr(kQKHeaddim == 96 || kQKHeaddim == 128)
             {
-                if constexpr(kHasBias)
-                    return 2;
+                // The gfx1250 strategy tile M128xN0_32 is chosen for 3 waves per SIMD (1024 / 3
+                // VGPRs); hold the compiler to that budget.
+                if constexpr(kM0 == 128 && kN0 == 32)
+                    return 3;
                 else
                     return 2;
             }
@@ -357,6 +378,25 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTdmTrLoad
             }
         };
 
+        // gfx950 kFoldScaleIntoExp: exp(s * scale_s - m') is evaluated as
+        // exp2(s * exp_scale - m * exp_scale), one fma plus one v_exp_f32 per element, so S leaves
+        // gemm_0 unscaled and m / m_old live in the unscaled domain (threshold unscaled too). Used
+        // with the vote-gated softmax; the bias / dropout instances keep the scaled exp path.
+        constexpr bool kFoldScaleIntoExp     = kVoteGatedSoftmax;
+        const CompDataType exp_scale         = type_convert<CompDataType>(
+            (kFoldScaleIntoExp ? scale_s : 1.0f) * log2e_v<float>);
+        const CompDataType m_reuse_threshold =
+            type_convert<CompDataType>(kFoldScaleIntoExp ? (-8.0f / scale_s) : -8.0f);
+        const auto f_exp2 = [](CompDataType x) {
+            return type_convert<CompDataType>(__builtin_amdgcn_exp2f(type_convert<float>(x)));
+        };
+
+        // gfx950 kKvBoundOnlyMask: non-causal cross attention without a local window admits every
+        // (row, col) pair, so only the columns past seqlen_k_end of the last kv-tile are masked.
+        using MaskType                  = remove_cvref_t<HstuMask>;
+        constexpr bool kKvBoundOnlyMask = kVoteGatedSoftmax && MaskType::kIsCrossAttention &&
+                                          !MaskType::kUseLocal && !MaskType::IsMasking;
+
         const auto bias_origin = bias_dram_block_window_tmp.get_window_origin();
         auto bias_dram_window =
             make_tile_window(bias_dram_block_window_tmp.get_bottom_tensor_view(),
@@ -390,6 +430,11 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTdmTrLoad
         clear_tile(o_acc);
         set_tile(m, -numeric<CompDataType>::infinity());
         clear_tile(l);
+
+        // kVoteGatedSoftmax: -m * exp_scale, the additive term of the exp2 argument (0 while m is
+        // -inf, whose rows only hold -inf scores)
+        auto nml = MLBlockTileType{};
+        clear_tile(nml);
 
         auto seqlen_k_curr = seqlen_k_start;
 
@@ -426,7 +471,11 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTdmTrLoad
 
                 __builtin_amdgcn_sched_barrier(0x00000001);
 
-                gemm_0(sacc_tile, q_tile, k_lds_cur[i_n0]);
+                if constexpr(kGemmRunAhead)
+                    gemm_0.template run_ahead<kGemm0Prefetch>(
+                        sacc_tile, q_tile, k_lds_cur[i_n0], [] {});
+                else
+                    gemm_0(sacc_tile, q_tile, k_lds_cur[i_n0]);
 
                 auto tmp_tile = cast_tile<CompDataType>(sacc_tile);
 
@@ -452,13 +501,33 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTdmTrLoad
 
                 move_tile_window(bias_dram_window, {0, kN0});
             }
-            else
+            else if constexpr(!kFoldScaleIntoExp)
             {
                 tile_elementwise_inout([&scale_s](auto& x) { x = x * scale_s; }, pcomp_tile);
             }
 
-            if(!mask.IsFullTileInsideMask(
-                   q_origin.at(number<0>{}), seqlen_k_curr, number<kN0>{}, number<kM0>{}))
+            if constexpr(kKvBoundOnlyMask)
+            {
+                if(seqlen_k_curr + kN0 > seqlen_k_end)
+                {
+                    const index_t kv_left  = seqlen_k_end - seqlen_k_curr;
+                    constexpr auto p_spans = PcompBlockTileType::get_distributed_spans();
+                    sweep_tile_span(p_spans[number<0>{}], [&](auto idx0) {
+                        sweep_tile_span(p_spans[number<1>{}], [&](auto idx1) {
+                            const auto tile_idx = get_x_indices_from_distributed_indices(
+                                pcomp_tile.get_tile_distribution(),
+                                make_tuple(idx0, idx1),
+                                partition_index);
+                            constexpr auto i_j_idx = make_tuple(idx0, idx1);
+                            pcomp_tile(i_j_idx)    = tile_idx.at(number<1>{}) < kv_left
+                                                         ? pcomp_tile[i_j_idx]
+                                                         : -numeric<CompDataType>::infinity();
+                        });
+                    });
+                }
+            }
+            else if(!mask.IsFullTileInsideMask(
+                        q_origin.at(number<0>{}), seqlen_k_curr, number<kN0>{}, number<kM0>{}))
             {
                 constexpr auto p_spans = PcompBlockTileType::get_distributed_spans();
                 // contextual_seqlen is a tile-invariant scalar, so hoist its test out of the
@@ -496,64 +565,127 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTdmTrLoad
             // V[t] was retired by the same barrier as K[t] in stage 1 and V[t+1] is already
             // in flight, so there is nothing to store and nothing to prefetch here.
 
-            const auto m_old = m;
+            if constexpr(kVoteGatedSoftmax)
+            {
+                const auto m_old = m;
+                auto m_loc       = m;
+                block_tile_reduce(m_loc, pcomp_tile, sequence<1>{}, f_max);
 
-            block_tile_reduce(m, pcomp_tile, sequence<1>{}, f_max);
-            block_tile_reduce_sync(m, f_max, bool_constant<false>{});
+                // m_old == -inf always votes (-inf - x is -inf or NaN)
+                constexpr auto m_spans = MLBlockTileType::get_distributed_spans();
+                bool need_exact        = false;
+                sweep_tile_span(m_spans[number<0>{}], [&](auto idx0) {
+                    constexpr auto i_idx = make_tuple(idx0);
+                    need_exact |= !(m_old[i_idx] - m_loc[i_idx] >= m_reuse_threshold);
+                });
 
-            __builtin_amdgcn_sched_barrier(0x00000001);
-
-            constexpr auto p_spans = decltype(pcomp_tile)::get_distributed_spans();
-            sweep_tile_span(p_spans[number<0>{}], [&](auto idx0) {
-                constexpr auto i_idx = make_tuple(idx0);
-
-                if(__builtin_expect(m[i_idx] == -numeric<CompDataType>::infinity(), 0)) // unlikely
+                if(__builtin_expect(detail::wave_any(need_exact), 0))
                 {
+                    block_tile_reduce_sync(m_loc, f_max, bool_constant<false>{});
+
+                    constexpr auto o_spans = decltype(o_acc)::get_distributed_spans();
+                    sweep_tile_span(o_spans[number<0>{}], [&](auto idx0) {
+                        constexpr auto i_idx = make_tuple(idx0);
+                        const CompDataType m_new =
+                            (m_old[i_idx] - m_loc[i_idx] >= m_reuse_threshold) ? m_old[i_idx]
+                                                                               : m_loc[i_idx];
+                        m(i_idx)   = m_new;
+                        nml(i_idx) = m_new == -numeric<CompDataType>::infinity()
+                                         ? type_convert<CompDataType>(0.0f)
+                                         : -m_new * exp_scale;
+                        if(m_new > m_old[i_idx])
+                        {
+                            const auto tmp = f_exp2((m_old[i_idx] - m_new) * exp_scale);
+                            l(i_idx) *= tmp;
+                            sweep_tile_span(o_spans[number<1>{}], [&](auto idx1) {
+                                o_acc(make_tuple(idx0, idx1)) *= tmp;
+                            });
+                        }
+                    });
+                }
+
+                constexpr auto p_spans = decltype(pcomp_tile)::get_distributed_spans();
+                sweep_tile_span(p_spans[number<0>{}], [&](auto idx0) {
+                    constexpr auto i_idx = make_tuple(idx0);
+                    const CompDataType nml_i = nml[i_idx];
                     sweep_tile_span(p_spans[number<1>{}], [&](auto idx1) {
                         constexpr auto i_j_idx = make_tuple(idx0, idx1);
-                        pcomp_tile(i_j_idx)    = type_convert<CompDataType>(0.0f);
+                        pcomp_tile(i_j_idx)    = f_exp2(pcomp_tile[i_j_idx] * exp_scale + nml_i);
+                    });
+                });
+
+                if constexpr(!kSoftmaxWmmaRowsum)
+                {
+                    // per-lane partial row sums, reduced across lanes once after the loop
+                    auto rowsum_p = block_tile_reduce<CompDataType>(
+                        pcomp_tile, sequence<1>{}, f_sum, CompDataType{0});
+                    sweep_tile_span(m_spans[number<0>{}], [&](auto idx0) {
+                        constexpr auto i_idx = make_tuple(idx0);
+                        l(i_idx) += rowsum_p[i_idx];
                     });
                 }
-                else
-                {
-                    // use the m_old[i] as the m-for-stablization if m_old[i] - m[i] >= -8.0f
-                    // and still keep the m-for-stablization in m[]
-                    if(m_old[i_idx] - m[i_idx] >= type_convert<CompDataType>(-8.0f))
-                        m(i_idx) = m_old[i_idx];
+            }
+            else
+            {
+                const auto m_old = m;
 
-                    sweep_tile_span(p_spans[number<1>{}], [&](auto idx1) {
-                        constexpr auto i_j_idx = make_tuple(idx0, idx1);
-                        pcomp_tile(i_j_idx)    = f_exp(pcomp_tile[i_j_idx] - m[i_idx]);
-                    });
-                }
-            });
+                block_tile_reduce(m, pcomp_tile, sequence<1>{}, f_max);
+                block_tile_reduce_sync(m, f_max, bool_constant<false>{});
 
-            auto rowsum_p =
-                block_tile_reduce<CompDataType>(pcomp_tile, sequence<1>{}, f_sum, CompDataType{0});
+                __builtin_amdgcn_sched_barrier(0x00000001);
 
-            block_tile_reduce_sync(rowsum_p, f_sum, bool_constant<false>{});
+                constexpr auto p_spans = decltype(pcomp_tile)::get_distributed_spans();
+                sweep_tile_span(p_spans[number<0>{}], [&](auto idx0) {
+                    constexpr auto i_idx = make_tuple(idx0);
 
-            // adjust o_acc[] according to the update between m and m_old
-            constexpr auto o_spans = decltype(o_acc)::get_distributed_spans();
-            sweep_tile_span(o_spans[number<0>{}], [&](auto idx0) {
-                constexpr auto i_idx = make_tuple(idx0);
+                    if(__builtin_expect(m[i_idx] == -numeric<CompDataType>::infinity(), 0)) // unlikely
+                    {
+                        sweep_tile_span(p_spans[number<1>{}], [&](auto idx1) {
+                            constexpr auto i_j_idx = make_tuple(idx0, idx1);
+                            pcomp_tile(i_j_idx)    = type_convert<CompDataType>(0.0f);
+                        });
+                    }
+                    else
+                    {
+                        // use the m_old[i] as the m-for-stablization if m_old[i] - m[i] >= -8.0f
+                        // and still keep the m-for-stablization in m[]
+                        if(m_old[i_idx] - m[i_idx] >= type_convert<CompDataType>(-8.0f))
+                            m(i_idx) = m_old[i_idx];
 
-                if(__builtin_expect(m[i_idx] == -numeric<CompDataType>::infinity(), 0)) // unlikely
-                {
-                    l(i_idx) = rowsum_p[i_idx];
-                }
-                else if(m[i_idx] > m_old[i_idx])
-                {
-                    const auto tmp = f_exp(m_old[i_idx] - m[i_idx]);
-                    l(i_idx)       = tmp * l[i_idx] + rowsum_p[i_idx];
-                    sweep_tile_span(o_spans[number<1>{}], [&](auto idx1) {
-                        constexpr auto i_j_idx = make_tuple(idx0, idx1);
-                        o_acc(i_j_idx) *= tmp;
-                    });
-                }
-                else
-                    l(i_idx) = l[i_idx] + rowsum_p[i_idx];
-            });
+                        sweep_tile_span(p_spans[number<1>{}], [&](auto idx1) {
+                            constexpr auto i_j_idx = make_tuple(idx0, idx1);
+                            pcomp_tile(i_j_idx)    = f_exp(pcomp_tile[i_j_idx] - m[i_idx]);
+                        });
+                    }
+                });
+
+                auto rowsum_p =
+                    block_tile_reduce<CompDataType>(pcomp_tile, sequence<1>{}, f_sum, CompDataType{0});
+
+                block_tile_reduce_sync(rowsum_p, f_sum, bool_constant<false>{});
+
+                // adjust o_acc[] according to the update between m and m_old
+                constexpr auto o_spans = decltype(o_acc)::get_distributed_spans();
+                sweep_tile_span(o_spans[number<0>{}], [&](auto idx0) {
+                    constexpr auto i_idx = make_tuple(idx0);
+
+                    if(__builtin_expect(m[i_idx] == -numeric<CompDataType>::infinity(), 0)) // unlikely
+                    {
+                        l(i_idx) = rowsum_p[i_idx];
+                    }
+                    else if(m[i_idx] > m_old[i_idx])
+                    {
+                        const auto tmp = f_exp(m_old[i_idx] - m[i_idx]);
+                        l(i_idx)       = tmp * l[i_idx] + rowsum_p[i_idx];
+                        sweep_tile_span(o_spans[number<1>{}], [&](auto idx1) {
+                            constexpr auto i_j_idx = make_tuple(idx0, idx1);
+                            o_acc(i_j_idx) *= tmp;
+                        });
+                    }
+                    else
+                        l(i_idx) = l[i_idx] + rowsum_p[i_idx];
+                });
+            }
 
             seqlen_k_curr += kN0;
 
@@ -571,12 +703,41 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTdmTrLoad
             __builtin_amdgcn_sched_barrier(0x00000001);
 
             // STAGE 3, Gemm_1 ( O = P@V )
-            static_for<0, k1_loops, 1>{}([&](auto i_k1) {
-                gemm_1(
-                    o_acc,
-                    get_slice_tile(p, sequence<0, i_k1 * kK1>{}, sequence<kM0, (i_k1 + 1) * kK1>{}),
-                    v_lds_cur[i_k1]);
-            });
+            if constexpr(kGemmRunAhead)
+            {
+                // gfx1250 WMMA row sum: a fresh accumulator per tile (the TransposeC C layout holds
+                // 8 copies of each row sum per lane, so a loop-carried one costs 16 VGPRs where l
+                // needs 2), issued ahead of gemm_1 so its WMMAs cover the latency before l reads it
+                auto rs = gemm_1.MakeRowSumTile();
+                if constexpr(kSoftmaxWmmaRowsum)
+                {
+                    clear_tile(rs);
+                    gemm_1.rowsum(p, rs);
+                }
+
+                gemm_1.template run_ahead<kGemm1Prefetch>(o_acc, p, v_lds_cur[number<0>{}], [] {});
+
+                if constexpr(kSoftmaxWmmaRowsum)
+                {
+                    constexpr auto rs_spans = decltype(rs)::get_distributed_spans();
+                    sweep_tile_span(rs_spans[number<0>{}], [&](auto idx0) {
+                        constexpr auto i_idx = make_tuple(idx0);
+                        CompDataType row_sum = 0;
+                        sweep_tile_span(rs_spans[number<1>{}],
+                                        [&](auto idx1) { row_sum = rs[make_tuple(idx0, idx1)]; });
+                        l(i_idx) += row_sum;
+                    });
+                }
+            }
+            else
+            {
+                static_for<0, k1_loops, 1>{}([&](auto i_k1) {
+                    gemm_1(o_acc,
+                           get_slice_tile(
+                               p, sequence<0, i_k1 * kK1>{}, sequence<kM0, (i_k1 + 1) * kK1>{}),
+                           v_lds_cur[i_k1]);
+                });
+            }
 
             // the copy just consumed becomes the Tdm target for the kv-tile after next
             auto k_lds_tmp = k_lds_cur;
@@ -587,6 +748,9 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTdmTrLoad
             v_lds_cur      = v_lds_next;
             v_lds_next     = v_lds_tmp;
         } while(seqlen_k_curr < seqlen_k_end);
+
+        if constexpr(kVoteGatedSoftmax && !kSoftmaxWmmaRowsum)
+            block_tile_reduce_sync(l, f_sum, bool_constant<false>{});
 
         // if pipeline is called from splitkv_kernel, the window shall not be null;
         // if pipeline is called from non-splitkv kernel, the window is null if kStoreLSE is false
@@ -599,7 +763,8 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTdmTrLoad
             constexpr auto lse_or_lse_acc_spans = decltype(lse_or_lse_acc)::get_distributed_spans();
             sweep_tile_span(lse_or_lse_acc_spans[number<0>{}], [&, m_ = m, l_ = l](auto idx0) {
                 constexpr auto i_idx  = make_tuple(idx0);
-                lse_or_lse_acc(i_idx) = m_[i_idx] + log(l_[i_idx]);
+                lse_or_lse_acc(i_idx) =
+                    m_[i_idx] * (kFoldScaleIntoExp ? scale_s : 1.0f) + log(l_[i_idx]);
             });
 
             store_tile(lse_or_lse_acc_dram_block_window, lse_or_lse_acc);
@@ -607,18 +772,14 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVSTdmTrLoad
 
         constexpr auto o_spans = decltype(o_acc)::get_distributed_spans();
 
+        // one reciprocal per row instead of a guarded division per element
         sweep_tile_span(o_spans[number<0>{}], [&](auto idx0) {
-            constexpr auto i_idx = make_tuple(idx0);
-            sweep_tile_span(o_spans[number<1>{}], [&](auto idx1) {
-                constexpr auto i_j_idx = make_tuple(idx0, idx1);
-
-                if(__builtin_expect(m[i_idx] == -numeric<CompDataType>::infinity(), 0)) // unlikely
-                {
-                    o_acc(i_j_idx) = 0.0f;
-                }
-                else
-                    o_acc(i_j_idx) *= 1.0f / l[i_idx];
-            });
+            constexpr auto i_idx     = make_tuple(idx0);
+            const CompDataType inv_l = m[i_idx] == -numeric<CompDataType>::infinity()
+                                           ? type_convert<CompDataType>(0.0f)
+                                           : rcp<CompDataType>(l[i_idx]);
+            sweep_tile_span(o_spans[number<1>{}],
+                            [&](auto idx1) { o_acc(make_tuple(idx0, idx1)) *= inv_l; });
         });
 
         return o_acc;

@@ -431,6 +431,107 @@ struct BlockGemmARegBSmemTrLoadCRegV2Hack_1
         return c_block_tensor;
     }
 
+    // An [MPerBlock, WG::kN] C tile with the row distribution of MakeCBlockTile(): the
+    // accumulator of rowsum().
+    CK_TILE_DEVICE static constexpr auto MakeRowSumTile()
+    {
+        constexpr index_t MPerBlock = BlockGemmShape::kM;
+
+        constexpr auto config = Policy::template GetWarpGemmMWarpNWarp<Problem>();
+
+        using WG = remove_cvref_t<decltype(config.template at<0>())>;
+
+        constexpr index_t MWarp = config.template at<1>();
+        static_assert(config.template at<2>() == 1, "rowsum needs the warps along M only");
+
+        constexpr index_t MIterPerWarp = MPerBlock / (MWarp * WG::kM);
+
+        constexpr auto c_block_outer_dstr_encoding =
+            tile_distribution_encoding<sequence<>,
+                                       tuple<sequence<MIterPerWarp, MWarp>, sequence<1, 1>>,
+                                       tuple<sequence<1, 2>>,
+                                       tuple<sequence<1, 1>>,
+                                       sequence<1, 2>,
+                                       sequence<0, 0>>{};
+
+        constexpr auto c_block_dstr_encode = detail::make_embed_tile_distribution_encoding(
+            c_block_outer_dstr_encoding, typename WG::CWarpDstrEncoding{});
+        return make_static_distributed_tensor<CDataType>(
+            make_static_tile_distribution(c_block_dstr_encode));
+    }
+
+    // c_rows += A @ ones on the matrix pipe, with the warp gemm and the A warp-tile slicing that
+    // compute() uses: every element of row r of c_rows is the fp32 sum of row r of A (the fp16 P
+    // that gemm_1 multiplies with V), whatever lane holds it, so no cross-lane reduction follows.
+    template <typename AFullBlockTensor, typename CRowTensor>
+    CK_TILE_DEVICE void rowsum(const AFullBlockTensor& a_full_block_tensor, CRowTensor& c_rows) const
+    {
+        constexpr auto config = Policy::template GetWarpGemmMWarpNWarp<Problem>();
+
+        using WG = remove_cvref_t<decltype(config.template at<0>())>;
+
+        constexpr index_t MPerBlock    = AFullBlockTensor{}.get_lengths()[number<0>{}];
+        constexpr index_t KFull        = AFullBlockTensor{}.get_lengths()[number<1>{}];
+        constexpr index_t KPerBlock    = BlockGemmShape::kK;
+        constexpr index_t NumKSlices   = KFull / KPerBlock;
+        constexpr index_t MWarp        = config.template at<1>();
+        constexpr index_t MIterPerWarp = MPerBlock / (MWarp * WG::kM);
+        constexpr index_t KIterPerWarp = KPerBlock / WG::kK;
+
+        static_assert(MPerBlock == BlockGemmShape::kM && KFull % KPerBlock == 0, "wrong!");
+
+        using ABlockTensor =
+            decltype(make_static_distributed_tensor<ADataType>(MakeABlockTileDistribution()));
+        using AWarpDstr   = typename WG::AWarpDstr;
+        using CWarpDstr   = typename WG::CWarpDstr;
+        using AWarpTensor = typename WG::AWarpTensor;
+        using BWarpTensor = typename WG::BWarpTensor;
+        using CWarpTensor = typename WG::CWarpTensor;
+
+        constexpr auto a_warp_y_lengths =
+            to_sequence(AWarpDstr{}.get_ys_to_d_descriptor().get_lengths());
+        constexpr auto c_warp_y_lengths =
+            to_sequence(CWarpDstr{}.get_ys_to_d_descriptor().get_lengths());
+        constexpr auto a_warp_y_index_zeros = uniform_sequence_gen_t<AWarpDstr::NDimY, 0>{};
+        constexpr auto c_warp_y_index_zeros = uniform_sequence_gen_t<CWarpDstr::NDimY, 0>{};
+
+        BWarpTensor ones;
+        static_for<0, BWarpTensor::get_thread_buffer_size(), 1>{}([&](auto i) {
+            ones.get_thread_buffer()(i) = type_convert<BDataType>(1.0f);
+        });
+
+        static_for<0, NumKSlices, 1>{}([&](auto ks) {
+            ABlockTensor a_block_tensor =
+                make_static_distributed_tensor<ADataType>(MakeABlockTileDistribution());
+            a_block_tensor.get_thread_buffer() =
+                get_slice_tile(a_full_block_tensor,
+                               sequence<0, ks * KPerBlock>{},
+                               sequence<MPerBlock, (ks + 1) * KPerBlock>{})
+                    .get_thread_buffer();
+
+            static_for<0, KIterPerWarp, 1>{}([&](auto kIter) {
+                static_for<0, MIterPerWarp, 1>{}([&](auto mIter) {
+                    AWarpTensor a_warp_tensor;
+                    a_warp_tensor.get_thread_buffer() = a_block_tensor.get_y_sliced_thread_data(
+                        merge_sequences(sequence<mIter, kIter>{}, a_warp_y_index_zeros),
+                        merge_sequences(sequence<1, 1>{}, a_warp_y_lengths));
+
+                    CWarpTensor c_warp_tensor;
+                    c_warp_tensor.get_thread_buffer() = c_rows.get_y_sliced_thread_data(
+                        merge_sequences(sequence<mIter, 0>{}, c_warp_y_index_zeros),
+                        merge_sequences(sequence<1, 1>{}, c_warp_y_lengths));
+
+                    WG{}(c_warp_tensor, a_warp_tensor, ones);
+
+                    c_rows.set_y_sliced_thread_data(
+                        merge_sequences(sequence<mIter, 0>{}, c_warp_y_index_zeros),
+                        merge_sequences(sequence<1, 1>{}, c_warp_y_lengths),
+                        c_warp_tensor.get_thread_buffer());
+                });
+            });
+        });
+    }
+
     // C = A * B
     template <typename ABlockTensorTmp, typename BBlockWindowTmp>
     CK_TILE_DEVICE auto operator()(const ABlockTensorTmp& a_block_tensor_tmp,

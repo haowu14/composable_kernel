@@ -617,6 +617,17 @@ struct HstuAttentionFwdSplitKVKernel
         kIsJagged && !kUseGroup && kIsCrossAttention && !kHasCausalMask && !kHasDropout &&
         !(HstuAttentionPipeline::kN1 < HstuAttentionPipeline::kQKHeaddim);
 
+    // q-tiles the kernel walks for one batch with min_full_attn_seqlen == 0: the targets get
+    // their own tiles after the upper scope [0, seqlen_q - num_target)
+    CK_TILE_DEVICE static index_t GetNumQTiles(index_t seqlen_q, index_t num_target)
+    {
+        constexpr index_t kM0 = HstuAttentionPipeline::kM0;
+        if(num_target > 0 && seqlen_q - num_target > 0)
+            return integer_divide_ceil(seqlen_q - num_target, kM0) +
+                   integer_divide_ceil(num_target, kM0);
+        return integer_divide_ceil(seqlen_q, kM0);
+    }
+
     CK_TILE_DEVICE static auto GetXcdBalancedTileIndex(const Kargs& kargs, index_t batch)
     {
         constexpr index_t kM0 = HstuAttentionPipeline::kM0;
@@ -635,8 +646,10 @@ struct HstuAttentionFwdSplitKVKernel
                 kargs.seq_q_offsets_ptr[lane + 1] - kargs.seq_q_offsets_ptr[lane];
             const index_t seqlen_kv =
                 kargs.seq_kv_offsets_ptr[lane + 1] - kargs.seq_kv_offsets_ptr[lane];
+            const index_t num_target =
+                kargs.num_targets_ptr == nullptr ? 0 : kargs.num_targets_ptr[lane];
             key   = integer_divide_ceil(integer_divide_ceil(seqlen_kv, kN0), num_splits);
-            items = min(integer_divide_ceil(seqlen_q, kM0), num_tile_m) * nhead * num_splits;
+            items = min(GetNumQTiles(seqlen_q, num_target), num_tile_m) * nhead * num_splits;
         }
 
         index_t items_before = 0;
@@ -650,7 +663,7 @@ struct HstuAttentionFwdSplitKVKernel
 
         const index_t lin   = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
         const bool is_mine  = lin >= items_before && lin < items_before + items;
-        const uint64_t mask = __builtin_amdgcn_ballot_w64(is_mine);
+        const uint64_t mask = detail::wave_ballot(is_mine);
 
         if(mask == 0)
             return ck_tile::make_tuple(
@@ -708,7 +721,7 @@ struct HstuAttentionFwdSplitKVKernel
         }
         else
         {
-#if defined(__gfx950__)
+#if defined(__gfx950__) || defined(__gfx1250__)
             if constexpr(kUseXcdBalancedTileMap)
             {
                 const index_t batch = kargs.almost_invariant_seqlen
